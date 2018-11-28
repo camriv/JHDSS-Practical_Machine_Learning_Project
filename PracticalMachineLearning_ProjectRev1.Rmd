@@ -1,0 +1,219 @@
+---
+title: "Predicting Qualitative Activity Using Supervised Machine Learning Models"
+author: "CARivero"
+date: "November 24, 2018"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE)
+library(scales)
+```
+
+
+## Executive Summary
+
+```{r ExecSummary, echo = FALSE, results = "hide", ref.label = c("prep", "clean", "part", "multicore", "algorithm", "base", "accBase", "stack", "accVal", "accTest")}
+```
+
+This study presents a supervised machine learning model that predicts the manner in which subjects performed a *unilateral dumbbell biceps curl* according to the measurement methods used and data acquired by Velloso, E. et al (2013) in their study [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). Measurements from accelerometers on the belt, forearm, arm, and dumbell of six male participants aged 20-28 were recorded while they perform barbell lifts correctly and incorrectly in 5 different ways. Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.
+        
+Class| Description
+---- | ----------------------------------------
+  A  | Exactly according to the specification
+  B  | Throwing the elbows to the front
+  C  | Lifting the dumbbell only halfway
+  D  | Lowering the dumbbell only halfway
+  E  | Throwing the hips to the front
+        
+Machine learning algorithms from the `caret` package in R were used for classification. Models were built initially on a training set, the best performing models stacked using predictions on a validation set, and finally evaluated for generalization (out of sample) accuracies on a testing set.
+        
+Results showed that model stacking on validation predictions was unnecessary as a **random forest model built on the training data** could already achieve an out of sample accuracy of **`r percent(accTestBase[4])`**. This is already equal to the highest accuracy attained by the stacked models. Nonetheless, this study showed that stacking could increase the generalization accuracy for bagging, boosting, and significantly so in linear discriminant analysis (`r paste0("+", percent((accTestStkd[1]-accTestBase[1])/accTestBase[1]))`).
+        
+The model was also used to predict 20 different test cases whose classes are unknown.
+
+
+## Prework
+
+## Getting and Cleaning Data
+
+After downloading and reading the raw training data, it was explored to be familiar with its properties such as header, row names, classes, and encoding of missing data.
+
+```{r prep, results = "hide"}
+link1 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+link2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+if (!file.exists("pml-training.csv")){download.file(link1, destfile = "pml-training.csv")}
+if (!file.exists("pml-testing.csv")){download.file(link2, destfile = "pml-testing.csv")}
+remove(link1,link2)
+raw <- read.csv("pml-training.csv")
+```
+
+It was then read again in consideration of the observations, and was cleaned to drop variables which are unnecessary for prediction and with predominantly missing values.
+
+```{r clean}
+raw <- read.csv("pml-training.csv", row.names = 1, na.strings = c("NA", "", "#DIV/0!"))
+drop <- c(1:6, which(colSums(is.na(raw))!=0))
+raw <- raw[,-drop]
+dim(raw)
+```
+
+
+### Prediction Study Design
+
+Five classification models were fitted on a training set, then the top performers on a validation set were stacked using the same methods. The out of sample accuracy of the base and stacked models were calculated on a testing set. Thus, the raw training data was split into `training` (60%), `validation` (20%) and `testing` (20%) sets.
+
+```{r part}
+library(caret)
+set.seed(3348)
+temp1 <- createDataPartition(raw$classe, p = 0.6, list = FALSE)
+temp2 <- createDataPartition(raw[-temp1,]$classe, p = 0.5, list = FALSE)
+training <- raw[temp1,]
+validation <- raw[-temp1,][temp2,]
+testing <- raw[-temp1,][-temp2,]
+remove(temp1, temp2)
+```
+
+It was verified that the aforementioned sets have enough observations per class to build models on and to enable assessment of corresponding model accuracy.
+
+```{r}
+sapply(list(training$classe,validation$classe,testing$classe),table)
+```
+
+
+## Model Building
+
+### Parallel Processing
+
+In order to reduce the processing time for fitting using `caret::train` especially for the random forest method, parallel processing was setup and deactivated once training was completed.
+
+```{r multicore}
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # Leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+
+### Fitting of Supervised Machine Learning Algorithms
+
+The following classification algorithms were used in this study:
+
+1. Linear discriminant analysis `lda`
+2. Classification trees (CART) `rpart`
+3. Classification with bootstrap aggregating (Bagged CART) `treebag`
+4. Random forest `rf`
+5. Stochastic Gradient Boosting `gbm`
+
+To reduce fitting time, the training control parameters were all set to allow parallel processing. The resampling method for the random forest model was also switched from default bootstrap to cross validation.
+
+```{r algorithm}
+method <- c("lda", "rpart", "treebag", "rf", "gbm")
+
+ctrl <- list(
+        lda = trainControl(allowParallel = TRUE),
+        rpart = trainControl(allowParallel = TRUE),
+        treebag = trainControl(allowParallel = TRUE),
+        rf = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+        gbm = trainControl(allowParallel = TRUE)
+)
+```
+
+Base models were fitted on the `training` set.
+
+```{r base, results = "hide"}
+fitBase <- list(); for(i in 1:5){
+        fitBase[[i]] <- train(classe~., method = method[i],
+        trControl = ctrl[[i]], data = training)
+}; names(fitBase) <- method
+```
+
+The in training sample accuracies were calculated by predicting back on the `training` set and comparing to the truth. However, the initial out of training sample accuracies, or the in validation sample accuracies, were more relevant in model selection. They were calculated in the same fashion as prior accuracies.
+
+``` {r accBase}
+predTrainBase <- lapply(fitBase, function(a) predict(a, training))
+accTrainBase <- sapply(predTrainBase, function(a) confusionMatrix(data = a,
+        ref = training$classe)$overall["Accuracy"])
+names(accTrainBase) <- method
+
+predValBase <- lapply(fitBase, function(a) predict(a, validation))
+accValBase <- sapply(predValBase, function(a) confusionMatrix(data = a,
+        ref = validation$classe)$overall["Accuracy"])
+names(accValBase) <- method
+
+round(rbind(accTrainBase,accValBase),4)
+```
+
+The aggregating methods (bagging, random forest, and boosting) have significantly lower bias than the other two models. However, they overfitted the training set since they lost some accuracy on the validation set while the weaker models slightly generalized better.
+
+To create a possibly stronger model without further increasing variance, the superior classifiers were combined through stacking. This was done by fitting models on the validation set predictions of the three superior base models. The same classification methods were used in fitting the stacked models.
+
+```{r stack, results = "hide"}
+fitStkd <- list(); for(i in 1:5){
+        fitStkd[[i]] <- train(classe~., method = method[i], trControl = ctrl[[i]], data = cbind(data.frame(predValBase[c(3:5)]), classe = validation$classe ))
+}; names(fitStkd) <- method
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+The in validation sample accuracies of the stacked methods were computed, proving that performance could be increased by combining classifiers. The benefit was most pronounced in the linear discriminant method, which jumped from a mediocre performing base model to a stacked model with an accuracy that rivaled that of the high performers. Meanwhile, the added benefits for the aggregating methods were quite miniscule considering that the base model accuracies were already very high.
+
+``` {r accVal}
+predValStkd <- lapply(fitStkd, function(a) predict(a, predValBase))
+accValStkd <- sapply(predValStkd, function(a) confusionMatrix(data = a,
+        ref = validation$classe)$overall["Accuracy"])
+names(accValStkd) <- method
+
+round(rbind(accValBase, accValStkd), 4)
+```
+
+
+## Out of Sample Accuracy and Model Selection
+
+To estimate the generalization accuracy, predictions were made on the `testing` set using the base and stacked models. These were then compared to the truth.
+
+```{r accTest}
+predTestBase <- lapply(fitBase, function(a) predict(a, testing))
+accTestBase <- sapply(predTestBase, function(a) confusionMatrix(data = a,
+        ref = testing$classe)$overall["Accuracy"])
+names(accTestBase) <- method
+
+predTestStkd <- lapply(fitStkd, function(a) predict(a, predTestBase))
+accTestStkd <- sapply(predTestStkd, function(a) confusionMatrix(data = a,
+        ref = testing$classe)$overall["Accuracy"])
+names(accTestStkd) <- method
+
+round(rbind(accTestBase, accTestStkd), 4)
+```
+
+As observed in the in validation sample accuracies, model performances were increased by combining classifiers especially so in the linear discriminant method (`r paste0("+", percent((accTestStkd[1]-accTestBase[1])/accTestBase[1]))`). More interestingly, the highest generalization accuracy estimate from the stacked model choices (`lda` and `gbm`) were limited to the highest estimate attained from the base models used for stacking - base `rf` at `r percent(accTestBase[4])`.
+
+Thus, the best model chosen was the base **random forest** fitted on the training data, as this straightforward model returned the same generalization bias as more complicated stacked models.
+
+Note that as expected the random forest algorithm tends to overfit, as the accuracy of the base model decreased when it was applied to new data.
+
+``` {r, echo = FALSE}
+temp <- c(accTrainBase[4], accValBase[4], accTestBase[4])
+names(temp) <- c("training", "validation", "testing")
+print(temp)
+```
+
+The same was true for the stacked model accuracy.
+
+``` {r, echo = FALSE}
+temp <- c(accValStkd[4], accTestStkd[4])
+names(temp) <- c("validation", "testing")
+print(temp); remove(temp)
+```
+
+## Prediction on Data with Unknown Classes
+
+The chosen model, base random forest, was applied on a `quiz` set, whose observations have no declared classification. The set was first cleaned in the same fashion as the `raw` training set prior prediction.
+
+```{r quiz}
+quiz <- read.csv("pml-testing.csv", row.names = 1, na.strings = c("NA", "", "#DIV/0!"))
+quiz <- quiz[,-drop]
+answers <- predict(fitBase$rf, quiz)
+names(answers) <- 1:nrow(quiz)
+print(answers)
+```
